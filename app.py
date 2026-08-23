@@ -56,7 +56,15 @@ def upload_to_drive(image_bytes, filename):
         folder_id = st.secrets["drive_folder_id"]
         file_metadata = {'name': filename, 'parents': [folder_id]}
         media = MediaIoBaseUpload(image_bytes, mimetype='image/jpeg', resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        
+        # 修正：加入 supportsAllDrives=True 參數，確保即使在共用硬碟也能成功寫入
+        file = service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id, webViewLink',
+            supportsAllDrives=True 
+        ).execute()
+        
         return file.get('id'), file.get('webViewLink')
     except Exception as e:
         st.error(f"上傳硬碟失敗: {e}")
