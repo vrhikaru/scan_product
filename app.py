@@ -9,9 +9,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# 0. 圖片壓字處理功能
+# 0. 圖片壓字處理功能 (加入 color 參數)
 # ==========================================
-def add_text_to_image(base_img, brand, style, gender, size):
+def add_text_to_image(base_img, brand, style, color, gender, size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font_size = int(img.width * 0.08) 
@@ -21,7 +21,8 @@ def add_text_to_image(base_img, brand, style, gender, size):
         font = ImageFont.load_default()
         
     text1 = f"{brand}"
-    text2 = f"{style} {gender} {size}"
+    text2 = f"{style} {color} {gender} {size}" # 將顏色加入第二行文字
+    
     x = int(img.width * 0.1)
     y = int(img.height * 0.75)
     line_spacing = font_size + 15
@@ -41,6 +42,9 @@ def add_text_to_image(base_img, brand, style, gender, size):
 # ==========================================
 def get_drive_service():
     key_dict = json.loads(st.secrets["gcp_service_account"])
+    # 修正：強制將私鑰中的雙斜線換行符號轉為真實換行，解決 PEM file 解析錯誤
+    key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+    
     credentials = service_account.Credentials.from_service_account_info(
         key_dict, scopes=['https://www.googleapis.com/auth/drive.file']
     )
@@ -58,7 +62,6 @@ def upload_to_drive(image_bytes, filename):
         st.error(f"上傳硬碟失敗: {e}")
         return None, None
 
-# 修改：支援傳入第二張標籤照片
 def analyze_clothing_with_gemini(main_image, label_image=None):
     client = genai.Client(api_key=st.secrets["gemini_api_key"])
     prompt = """
@@ -72,7 +75,6 @@ def analyze_clothing_with_gemini(main_image, label_image=None):
     請僅回傳純 JSON 格式。
     """
     
-    # 將圖片與提示詞打包，若有標籤照片則一併加入
     contents_list = [main_image]
     if label_image:
         contents_list.append(label_image)
@@ -92,7 +94,6 @@ if 'step' not in st.session_state:
     st.session_state.step = 1
 if 'image_data' not in st.session_state:
     st.session_state.image_data = None
-# 新增：暫存標籤照片的變數
 if 'label_image_data' not in st.session_state:
     st.session_state.label_image_data = None
 if 'tags' not in st.session_state:
@@ -121,7 +122,6 @@ elif st.session_state.step == 2:
     main_image = Image.open(io.BytesIO(st.session_state.image_data))
     st.image(main_image, caption="已拍攝的主照片", use_container_width=True)
     
-    # 新增：補拍標籤的相機區塊 (選填)
     label_photo = st.camera_input("📸 補拍衣服內標 (選填：提高品牌與尺寸準確度)")
     if label_photo is not None:
         st.session_state.label_image_data = label_photo.getvalue()
@@ -139,7 +139,6 @@ elif st.session_state.step == 2:
             with st.status("🤖 正在綜合分析照片中...", expanded=True) as status:
                 st.write("1. 正在傳送影像資料至 Gemini AI...")
                 try:
-                    # 判斷是否有拍攝標籤照片
                     label_image = None
                     if st.session_state.label_image_data:
                         label_image = Image.open(io.BytesIO(st.session_state.label_image_data))
@@ -165,6 +164,8 @@ elif st.session_state.step == 3:
         col1, col2 = st.columns(2)
         with col1:
             brand = st.text_input("品牌", value=tags.get("brand", "未知"))
+            # 修正：將顏色欄位加回介面
+            color = st.text_input("顏色", value=tags.get("color", "")) 
             gender_options = ["男", "女", "中性"]
             gender_idx = gender_options.index(tags.get("gender")) if tags.get("gender") in gender_options else 2
             gender = st.selectbox("性別", gender_options, index=gender_idx)
@@ -176,7 +177,8 @@ elif st.session_state.step == 3:
         
         if submit_button:
             with st.spinner("正在合成照片並上傳至雲端..."):
-                processed_image = add_text_to_image(main_image, brand, style, gender, size)
+                # 修正：將 color 變數傳遞給壓字功能
+                processed_image = add_text_to_image(main_image, brand, style, color, gender, size) 
                 img_byte_arr = io.BytesIO()
                 processed_image.save(img_byte_arr, format='JPEG')
                 img_byte_arr.seek(0)
@@ -202,6 +204,6 @@ elif st.session_state.step == 4:
     if st.button("📸 拍下一件衣服", type="primary", use_container_width=True):
         st.session_state.step = 1
         st.session_state.image_data = None
-        st.session_state.label_image_data = None # 清空標籤暫存
+        st.session_state.label_image_data = None
         st.session_state.tags = {}
         st.rerun()
