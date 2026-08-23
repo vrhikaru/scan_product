@@ -3,13 +3,14 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import json
 import time
+import os
 from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# 0. 圖片壓字處理功能 (加入 color 參數)
+# 0. 圖片壓字處理功能
 # ==========================================
 def add_text_to_image(base_img, brand, style, color, gender, size):
     img = base_img.copy()
@@ -21,7 +22,7 @@ def add_text_to_image(base_img, brand, style, color, gender, size):
         font = ImageFont.load_default()
         
     text1 = f"{brand}"
-    text2 = f"{style} {color} {gender} {size}" # 將顏色加入第二行文字
+    text2 = f"{style} {color} {gender} {size}"
     
     x = int(img.width * 0.1)
     y = int(img.height * 0.75)
@@ -41,10 +42,15 @@ def add_text_to_image(base_img, brand, style, color, gender, size):
 # 1. API 服務初始化與功能函式
 # ==========================================
 def get_drive_service():
-    key_dict = json.loads(st.secrets["gcp_service_account"])
-    # 修正：強制將私鑰中的雙斜線換行符號轉為真實換行，解決 PEM file 解析錯誤
-    key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-    
+    gcp_secret = st.secrets["gcp_service_account"]
+    if isinstance(gcp_secret, str):
+        key_dict = json.loads(gcp_secret)
+    else:
+        key_dict = dict(gcp_secret)
+        
+    if "private_key" in key_dict:
+        key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
+        
     credentials = service_account.Credentials.from_service_account_info(
         key_dict, scopes=['https://www.googleapis.com/auth/drive.file']
     )
@@ -56,18 +62,16 @@ def upload_to_drive(image_bytes, filename):
         folder_id = st.secrets["drive_folder_id"]
         file_metadata = {'name': filename, 'parents': [folder_id]}
         media = MediaIoBaseUpload(image_bytes, mimetype='image/jpeg', resumable=True)
-        
-        # 修正：加入 supportsAllDrives=True 參數，確保即使在共用硬碟也能成功寫入
         file = service.files().create(
             body=file_metadata, 
             media_body=media, 
             fields='id, webViewLink',
-            supportsAllDrives=True 
+            supportsAllDrives=True
         ).execute()
-        
         return file.get('id'), file.get('webViewLink')
     except Exception as e:
-        st.error(f"上傳硬碟失敗: {e}")
+        # 這裡把原本的 st.error 改成回傳錯誤訊息，讓流程繼續往下走
+        print(f"上傳硬碟失敗: {e}")
         return None, None
 
 def analyze_clothing_with_gemini(main_image, label_image=None):
@@ -130,10 +134,10 @@ elif st.session_state.step == 2:
     main_image = Image.open(io.BytesIO(st.session_state.image_data))
     st.image(main_image, caption="已拍攝的主照片", use_container_width=True)
     
-    label_photo = st.camera_input("📸 補拍衣服內標 (選填：提高品牌與尺寸準確度)")
+    label_photo = st.camera_input("📸 補拍衣服內標 (選填)")
     if label_photo is not None:
         st.session_state.label_image_data = label_photo.getvalue()
-        st.success("✅ 已記錄標籤照片，將與主照片一併送出分析！")
+        st.success("✅ 已記錄標籤照片！")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -161,7 +165,7 @@ elif st.session_state.step == 2:
                     st.error("分析發生錯誤：")
                     st.code(str(e))
 
-# --- 步驟 3：微調與上傳 ---
+# --- 步驟 3：微調與存檔 ---
 elif st.session_state.step == 3:
     st.info("步驟 3/3：微調標籤並儲存")
     tags = st.session_state.tags
@@ -172,7 +176,6 @@ elif st.session_state.step == 3:
         col1, col2 = st.columns(2)
         with col1:
             brand = st.text_input("品牌", value=tags.get("brand", "未知"))
-            # 修正：將顏色欄位加回介面
             color = st.text_input("顏色", value=tags.get("color", "")) 
             gender_options = ["男", "女", "中性"]
             gender_idx = gender_options.index(tags.get("gender")) if tags.get("gender") in gender_options else 2
@@ -181,34 +184,62 @@ elif st.session_state.step == 3:
             style = st.text_input("樣式", value=tags.get("style", ""))
             size = st.text_input("尺寸", value=tags.get("size", "未標示"))
             
-        submit_button = st.form_submit_button("🚀 壓印圖片並存入硬碟", use_container_width=True)
+        submit_button = st.form_submit_button("🚀 處理照片並存檔", use_container_width=True)
         
         if submit_button:
-            with st.spinner("正在合成照片並上傳至雲端..."):
-                # 修正：將 color 變數傳遞給壓字功能
-                processed_image = add_text_to_image(main_image, brand, style, color, gender, size) 
+            with st.spinner("正在合成照片並嘗試上傳..."):
+                processed_image = add_text_to_image(main_image, brand, style, color, gender, size)
+                
+                # 轉為 bytes 供上傳與下載使用
                 img_byte_arr = io.BytesIO()
                 processed_image.save(img_byte_arr, format='JPEG')
-                img_byte_arr.seek(0)
+                img_data = img_byte_arr.getvalue()
                 
                 filename = f"clothing_tagged_{int(time.time())}.jpg"
+                
+                # --- 新增：強制存入本地端資料夾 ---
+                local_dir = "local_saves"
+                os.makedirs(local_dir, exist_ok=True) # 如果資料夾不存在則自動建立
+                local_path = os.path.join(local_dir, filename)
+                processed_image.save(local_path, format='JPEG')
+                st.session_state.local_path = local_path
+                
+                # --- 嘗試上傳雲端 ---
+                img_byte_arr.seek(0)
                 file_id, web_link = upload_to_drive(img_byte_arr, filename)
                 
-                if file_id:
-                    st.session_state.web_link = web_link
-                    st.session_state.final_image_data = img_byte_arr.getvalue()
-                    st.session_state.step = 4
-                    st.rerun()
+                # 將結果存入狀態管理
+                st.session_state.web_link = web_link
+                st.session_state.final_image_data = img_data
+                st.session_state.filename = filename
+                st.session_state.step = 4
+                st.rerun()
 
-# --- 步驟 4：完成畫面 ---
+# --- 步驟 4：完成與下載畫面 ---
 elif st.session_state.step == 4:
-    st.success("🎉 照片已成功壓字並存入 Google 硬碟！")
     
+    # 判斷雲端是否有成功
+    if st.session_state.web_link:
+        st.success("🎉 照片已成功壓字並存入 Google 硬碟與本地端！")
+        st.write(f"[🔗 點此檢視 Google 硬碟中的照片]({st.session_state.web_link})")
+    else:
+        st.warning(f"⚠️ Google 硬碟上傳失敗，但照片已安全備份至伺服器本地端資料夾：`{st.session_state.local_path}`")
+    
+    # 顯示最終結果
     final_image = Image.open(io.BytesIO(st.session_state.final_image_data))
     st.image(final_image, caption="最終合成照片", use_container_width=True)
-    st.write(f"[🔗 點此檢視 Google 硬碟中的照片]({st.session_state.web_link})")
     
     st.divider()
+    
+    # 新增：直接下載照片的按鈕
+    st.download_button(
+        label="💾 下載這張照片到手機相簿",
+        data=st.session_state.final_image_data,
+        file_name=st.session_state.filename,
+        mime="image/jpeg",
+        use_container_width=True
+    )
+    
     if st.button("📸 拍下一件衣服", type="primary", use_container_width=True):
         st.session_state.step = 1
         st.session_state.image_data = None
