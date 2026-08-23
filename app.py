@@ -10,12 +10,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# 0. 圖片壓字處理功能
+# 0. 圖片壓字處理功能 (支援自動換行)
 # ==========================================
 def add_text_to_image(base_img, brand, style, color, gender, size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font_size = int(img.width * 0.08) 
+    
     try:
         font = ImageFont.truetype("font.ttf", font_size)
     except IOError:
@@ -24,9 +25,35 @@ def add_text_to_image(base_img, brand, style, color, gender, size):
     text1 = f"{brand}"
     text2 = f"{style} {color} {gender} {size}"
     
-    x = int(img.width * 0.1)
-    y = int(img.height * 0.75)
-    line_spacing = font_size + 15
+    # 設定左右邊距與最大允許寬度
+    margin_x = int(img.width * 0.1)
+    max_text_width = img.width - (margin_x * 2)
+    
+    # 自動換行邏輯副程式
+    def wrap_text(text, font, max_width):
+        lines = []
+        current_line = ""
+        for char in text:
+            # 測試加上這個字後，寬度是否會超過
+            test_line = current_line + char
+            # 使用 draw.textlength 來計算真實像素寬度
+            length = draw.textlength(test_line, font=font)
+            
+            if length <= max_width:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = char
+        if current_line:
+            lines.append(current_line)
+        return lines
+
+    # 將兩段文字分別進行自動換行處理
+    wrapped_lines = wrap_text(text1, font, max_text_width) + wrap_text(text2, font, max_text_width)
+    
+    # 決定起始 Y 座標
+    start_y = int(img.height * 0.70)
+    line_spacing = font_size + int(font_size * 0.2) # 行距設為字體的 1.2 倍
     
     def draw_text_with_outline(text, pos_x, pos_y):
         for adj_x in range(-3, 4):
@@ -34,8 +61,12 @@ def add_text_to_image(base_img, brand, style, color, gender, size):
                 draw.text((pos_x + adj_x, pos_y + adj_y), text, font=font, fill="black")
         draw.text((pos_x, pos_y), text, font=font, fill="white")
         
-    draw_text_with_outline(text1, x, y)
-    draw_text_with_outline(text2, x, y + line_spacing)
+    # 逐行畫上圖片
+    current_y = start_y
+    for line in wrapped_lines:
+        draw_text_with_outline(line, margin_x, current_y)
+        current_y += line_spacing
+        
     return img
 
 # ==========================================
@@ -185,23 +216,19 @@ elif st.session_state.step == 3:
             style = st.text_input("樣式", value=tags.get("style", ""))
             size = st.text_input("尺寸", value=tags.get("size", "未標示"))
             
-        # 按鈕改為「預覽」，不進行上傳
         preview_button = st.form_submit_button("👀 預覽合成結果", use_container_width=True)
         
         if preview_button:
-            # 1. 儲存目前編輯的文字到暫存，避免返回時不見
             st.session_state.tags.update({
                 "brand": brand, "color": color, "gender": gender, 
                 "style": style, "size": size
             })
             
-            # 2. 產生壓字圖片並暫存
             processed_image = add_text_to_image(main_image, brand, style, color, gender, size)
             img_byte_arr = io.BytesIO()
             processed_image.save(img_byte_arr, format='JPEG')
             st.session_state.preview_image_data = img_byte_arr.getvalue()
             
-            # 3. 前往預覽步驟
             st.session_state.step = 4
             st.rerun()
 
@@ -209,7 +236,6 @@ elif st.session_state.step == 3:
 elif st.session_state.step == 4:
     st.info("步驟 4/4：預覽確認")
     
-    # 顯示剛剛合成的預覽圖
     preview_img = Image.open(io.BytesIO(st.session_state.preview_image_data))
     st.image(preview_img, caption="照片預覽 (若確認無誤請點擊下方儲存)", use_container_width=True)
     
@@ -224,7 +250,6 @@ elif st.session_state.step == 4:
             with st.spinner("正在上傳至雲端與本地備份..."):
                 filename = f"clothing_tagged_{int(time.time())}.jpg"
                 
-                # --- 存入本地端資料夾 ---
                 local_dir = "local_saves"
                 os.makedirs(local_dir, exist_ok=True)
                 local_path = os.path.join(local_dir, filename)
@@ -233,7 +258,6 @@ elif st.session_state.step == 4:
                 st.session_state.local_path = local_path
                 st.session_state.filename = filename
                 
-                # --- 嘗試上傳雲端 ---
                 img_byte_arr = io.BytesIO(st.session_state.preview_image_data)
                 file_id, web_link = upload_to_drive(img_byte_arr, filename)
                 
