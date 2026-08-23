@@ -74,10 +74,13 @@ def analyze_clothing_with_gemini(image):
 
     請僅回傳純 JSON 格式。
     """
+    
+    # 👇 將模型名稱更新為最新的 Gemini 3.7 Flash
     response = client.models.generate_content(
-        model='gemini-2.5-flash',
+        model='gemini-3.7-flash', 
         contents=[image, prompt]
     )
+    
     clean_text = response.text.strip().replace('```json', '').replace('```', '')
     return json.loads(clean_text)
 
