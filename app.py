@@ -15,7 +15,6 @@ def add_text_to_image(base_img, brand, style, gender, size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font_size = int(img.width * 0.08) 
-    
     try:
         font = ImageFont.truetype("font.ttf", font_size)
     except IOError:
@@ -23,17 +22,14 @@ def add_text_to_image(base_img, brand, style, gender, size):
         
     text1 = f"{brand}"
     text2 = f"{style} {gender} {size}"
-    
     x = int(img.width * 0.1)
     y = int(img.height * 0.75)
     line_spacing = font_size + 15
     
     def draw_text_with_outline(text, pos_x, pos_y):
-        outline_color = "black"
-        thickness = 3
-        for adj_x in range(-thickness, thickness+1):
-            for adj_y in range(-thickness, thickness+1):
-                draw.text((pos_x + adj_x, pos_y + adj_y), text, font=font, fill=outline_color)
+        for adj_x in range(-3, 4):
+            for adj_y in range(-3, 4):
+                draw.text((pos_x + adj_x, pos_y + adj_y), text, font=font, fill="black")
         draw.text((pos_x, pos_y), text, font=font, fill="white")
         
     draw_text_with_outline(text1, x, y)
@@ -62,35 +58,43 @@ def upload_to_drive(image_bytes, filename):
         st.error(f"上傳硬碟失敗: {e}")
         return None, None
 
-def analyze_clothing_with_gemini(image):
+# 修改：支援傳入第二張標籤照片
+def analyze_clothing_with_gemini(main_image, label_image=None):
     client = genai.Client(api_key=st.secrets["gemini_api_key"])
     prompt = """
-    請分析這張衣服照片，並以繁體中文 JSON 格式回傳以下欄位：
-    - brand: 品牌名稱 (若看不出來則填 "未知")
+    請分析提供的衣服照片（可能包含主照片與標籤特寫），並以繁體中文 JSON 格式回傳以下欄位：
+    - brand: 品牌名稱 (若有標籤照片請優先參考，若無則填 "未知")
     - style: 服飾樣式 (如：風衣、短袖T恤等)
     - color: 主要顏色
     - gender: 適合性別 (男、女、或 中性)
-    - size: 尺寸標籤 (若有拍到標籤請填寫如 S/M/L/XL，若無請填 "未標示")
+    - size: 尺寸標籤 (若有標籤照片請優先參考如 S/M/L/XL，若無請填 "未標示")
 
     請僅回傳純 JSON 格式。
     """
     
-    # 👇 將模型名稱更新為最新的 Gemini 3.7 Flash
+    # 將圖片與提示詞打包，若有標籤照片則一併加入
+    contents_list = [main_image]
+    if label_image:
+        contents_list.append(label_image)
+    contents_list.append(prompt)
+
     response = client.models.generate_content(
-        model='gemini-3.7-flash', 
-        contents=[image, prompt]
+        model='gemini-3.7-flash',
+        contents=contents_list
     )
-    
     clean_text = response.text.strip().replace('```json', '').replace('```', '')
     return json.loads(clean_text)
 
 # ==========================================
-# 2. 狀態管理初始化 (核心邏輯)
+# 2. 狀態管理初始化
 # ==========================================
 if 'step' not in st.session_state:
-    st.session_state.step = 1 # 預設從步驟 1 開始
+    st.session_state.step = 1
 if 'image_data' not in st.session_state:
     st.session_state.image_data = None
+# 新增：暫存標籤照片的變數
+if 'label_image_data' not in st.session_state:
+    st.session_state.label_image_data = None
 if 'tags' not in st.session_state:
     st.session_state.tags = {}
 
@@ -100,39 +104,49 @@ if 'tags' not in st.session_state:
 st.set_page_config(page_title="智慧衣物排程標記系統", layout="centered")
 st.title("👕 智慧衣物排程標記系統")
 
-# --- 步驟 1：拍照 ---
+# --- 步驟 1：拍攝主照片 ---
 if st.session_state.step == 1:
-    st.info("步驟 1/3：請拍攝衣物照片")
-    photo = st.camera_input("拍照辨識衣服")
+    st.info("步驟 1/3：請拍攝衣服全貌照片")
+    photo = st.camera_input("拍攝衣服全貌")
     
     if photo is not None:
-        # 將照片存入暫存，並前往步驟 2
         st.session_state.image_data = photo.getvalue()
         st.session_state.step = 2
-        st.rerun() # 強制刷新畫面，隱藏相機
+        st.rerun()
 
-# --- 步驟 2：AI 分析 ---
+# --- 步驟 2：補拍標籤與 AI 分析 ---
 elif st.session_state.step == 2:
-    st.info("步驟 2/3：確認照片並進行分析")
+    st.info("步驟 2/3：確認主照片，並可選填補拍衣標")
     
-    # 從暫存讀取照片並顯示
-    image = Image.open(io.BytesIO(st.session_state.image_data))
-    st.image(image, caption="已拍攝的照片", use_container_width=True)
+    main_image = Image.open(io.BytesIO(st.session_state.image_data))
+    st.image(main_image, caption="已拍攝的主照片", use_container_width=True)
+    
+    # 新增：補拍標籤的相機區塊 (選填)
+    label_photo = st.camera_input("📸 補拍衣服內標 (選填：提高品牌與尺寸準確度)")
+    if label_photo is not None:
+        st.session_state.label_image_data = label_photo.getvalue()
+        st.success("✅ 已記錄標籤照片，將與主照片一併送出分析！")
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("📸 重新拍照", use_container_width=True):
+        if st.button("🔄 重新拍攝主照片", use_container_width=True):
             st.session_state.step = 1
+            st.session_state.label_image_data = None
             st.rerun()
             
     with col2:
         if st.button("✨ 開始 AI 自動分析", use_container_width=True):
-            with st.status("🤖 正在處理照片中...", expanded=True) as status:
-                st.write("1. 正在傳送至 Gemini AI...")
+            with st.status("🤖 正在綜合分析照片中...", expanded=True) as status:
+                st.write("1. 正在傳送影像資料至 Gemini AI...")
                 try:
-                    st.session_state.tags = analyze_clothing_with_gemini(image)
+                    # 判斷是否有拍攝標籤照片
+                    label_image = None
+                    if st.session_state.label_image_data:
+                        label_image = Image.open(io.BytesIO(st.session_state.label_image_data))
+                    
+                    st.session_state.tags = analyze_clothing_with_gemini(main_image, label_image)
                     status.update(label="✅ AI 分析成功！", state="complete", expanded=False)
-                    time.sleep(1) # 短暫暫停讓使用者看到成功訊息
+                    time.sleep(1)
                     st.session_state.step = 3
                     st.rerun()
                 except Exception as e:
@@ -144,7 +158,7 @@ elif st.session_state.step == 2:
 elif st.session_state.step == 3:
     st.info("步驟 3/3：微調標籤並儲存")
     tags = st.session_state.tags
-    image = Image.open(io.BytesIO(st.session_state.image_data))
+    main_image = Image.open(io.BytesIO(st.session_state.image_data))
     
     with st.form("schedule_form"):
         st.subheader("確認或微調標籤")
@@ -162,8 +176,7 @@ elif st.session_state.step == 3:
         
         if submit_button:
             with st.spinner("正在合成照片並上傳至雲端..."):
-                processed_image = add_text_to_image(image, brand, style, gender, size)
-                
+                processed_image = add_text_to_image(main_image, brand, style, gender, size)
                 img_byte_arr = io.BytesIO()
                 processed_image.save(img_byte_arr, format='JPEG')
                 img_byte_arr.seek(0)
@@ -173,7 +186,6 @@ elif st.session_state.step == 3:
                 
                 if file_id:
                     st.session_state.web_link = web_link
-                    # 存入另外的變數方便步驟 4 顯示圖片
                     st.session_state.final_image_data = img_byte_arr.getvalue()
                     st.session_state.step = 4
                     st.rerun()
@@ -188,8 +200,8 @@ elif st.session_state.step == 4:
     
     st.divider()
     if st.button("📸 拍下一件衣服", type="primary", use_container_width=True):
-        # 清空所有暫存狀態，回到步驟 1
         st.session_state.step = 1
         st.session_state.image_data = None
+        st.session_state.label_image_data = None # 清空標籤暫存
         st.session_state.tags = {}
         st.rerun()
