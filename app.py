@@ -92,10 +92,11 @@ def upload_to_drive(image_bytes, filename):
             fields='id, webViewLink',
             supportsAllDrives=True
         ).execute()
-        return file.get('id'), file.get('webViewLink')
+        # 成功時回傳 ID, 網址, 且錯誤訊息為 None
+        return file.get('id'), file.get('webViewLink'), None
     except Exception as e:
-        print(f"上傳硬碟失敗: {e}")
-        return None, None
+        # 失敗時回傳真實的錯誤訊息
+        return None, None, str(e)
 
 def analyze_clothing_with_gemini(main_image, label_image=None):
     client = genai.Client(api_key=st.secrets["gemini_api_key"])
@@ -135,6 +136,8 @@ if 'tags' not in st.session_state:
     st.session_state.tags = {}
 if 'preview_image_data' not in st.session_state:
     st.session_state.preview_image_data = None
+if 'upload_error' not in st.session_state:
+    st.session_state.upload_error = None
 
 # ==========================================
 # 3. 網頁前端介面與流程控制
@@ -249,9 +252,12 @@ elif st.session_state.step == 4:
             st.session_state.filename = filename
             
             img_byte_arr = io.BytesIO(st.session_state.preview_image_data)
-            file_id, web_link = upload_to_drive(img_byte_arr, filename)
+            
+            # 接收上傳函式回傳的三個值 (包含錯誤訊息)
+            file_id, web_link, error_msg = upload_to_drive(img_byte_arr, filename)
             
             st.session_state.web_link = web_link
+            st.session_state.upload_error = error_msg
             st.session_state.step = 5
             st.rerun()
             
@@ -267,7 +273,9 @@ elif st.session_state.step == 5:
         st.success("🎉 照片已成功存入 Google 硬碟與本地端！")
         st.write(f"[🔗 點此檢視 Google 硬碟中的照片]({st.session_state.web_link})")
     else:
-        st.warning(f"⚠️ Google 硬碟上傳失敗，但照片已安全備份至本地端資料夾：`{st.session_state.local_path}`")
+        # 明確顯示紅色的錯誤方塊與系統原因
+        st.error(f"⚠️ Google 硬碟上傳失敗！\n\n系統回報錯誤：{st.session_state.upload_error}")
+        st.info(f"💡 照片已安全備份至本地端資料夾：`{st.session_state.local_path}`")
     
     final_image = Image.open(io.BytesIO(st.session_state.preview_image_data))
     st.image(final_image, caption="最終完成照片", use_container_width=True)
@@ -288,4 +296,5 @@ elif st.session_state.step == 5:
         st.session_state.label_image_data = None
         st.session_state.tags = {}
         st.session_state.preview_image_data = None
+        st.session_state.upload_error = None
         st.rerun()
