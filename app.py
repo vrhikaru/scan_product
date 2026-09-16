@@ -3,298 +3,258 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import json
 import time
-import os
+import base64
 from google import genai
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+import streamlit.components.v1 as components
 
 # ==========================================
-# 0. 圖片壓字處理功能
+# 0. 圖片壓字（壓成機器好讀的三行：名稱 / 性別尺寸 / 庫存N）
 # ==========================================
-def add_text_to_image(base_img, brand, style, color, gender, size):
-    img = base_img.copy()
+def add_text_to_image(base_img, brand, style, color, gender, size, qty):
+    img = base_img.copy().convert("RGB")
     draw = ImageDraw.Draw(img)
-    font_size = int(img.width * 0.08) 
-    
+    font_size = int(img.width * 0.075)
     try:
         font = ImageFont.truetype("font.ttf", font_size)
     except IOError:
         font = ImageFont.load_default()
-        
-    text1 = f"{brand}"
-    text2 = f"{style} {color} {gender} {size}"
-    
-    margin_x = int(img.width * 0.1)
-    max_text_width = img.width - (margin_x * 2)
-    
-    def wrap_text(text, font, max_width):
-        lines = []
-        current_line = ""
-        for char in text:
-            test_line = current_line + char
-            length = draw.textlength(test_line, font=font)
-            
-            if length <= max_width:
-                current_line = test_line
+
+    def clean(v, skip):
+        v = (v or "").strip()
+        return "" if v in skip else v
+
+    line1 = " ".join(x for x in [clean(brand, ["未知"]), clean(style, []), clean(color, [])] if x)
+    line2 = " ".join(x for x in [clean(gender, []), clean(size, ["未標示"])] if x)
+    line3 = f"庫存 {qty}"                      # 🔑 這行是給 LINE 機器人解析庫存用的固定 token
+    raw_lines = [line1, line2, line3]
+
+    margin_x = int(img.width * 0.06)
+    max_text_width = img.width - margin_x * 2
+
+    def wrap_text(text):
+        if not text:
+            return []
+        lines, cur = [], ""
+        for ch in text:
+            if draw.textlength(cur + ch, font=font) <= max_text_width:
+                cur += ch
             else:
-                lines.append(current_line)
-                current_line = char
-        if current_line:
-            lines.append(current_line)
+                lines.append(cur)
+                cur = ch
+        if cur:
+            lines.append(cur)
         return lines
 
-    wrapped_lines = wrap_text(text1, font, max_text_width) + wrap_text(text2, font, max_text_width)
-    
-    start_y = int(img.height * 0.70)
-    line_spacing = font_size + int(font_size * 0.2) 
-    
-    def draw_text_with_outline(text, pos_x, pos_y):
-        for adj_x in range(-3, 4):
-            for adj_y in range(-3, 4):
-                draw.text((pos_x + adj_x, pos_y + adj_y), text, font=font, fill="black")
-        draw.text((pos_x, pos_y), text, font=font, fill="white")
-        
-    current_y = start_y
-    for line in wrapped_lines:
-        draw_text_with_outline(line, margin_x, current_y)
-        current_y += line_spacing
-        
+    wrapped = []
+    for t in raw_lines:
+        wrapped += wrap_text(t)
+
+    line_spacing = font_size + int(font_size * 0.25)
+    total_h = line_spacing * len(wrapped)
+    start_y = img.height - total_h - int(img.height * 0.04)  # 貼齊底部往上排
+
+    def draw_outline(text, x, y):
+        for ax in range(-3, 4):
+            for ay in range(-3, 4):
+                draw.text((x + ax, y + ay), text, font=font, fill="black")
+        draw.text((x, y), text, font=font, fill="white")
+
+    y = start_y
+    for line in wrapped:
+        draw_outline(line, margin_x, y)
+        y += line_spacing
     return img
 
-# ==========================================
-# 1. API 服務初始化與功能函式
-# ==========================================
-def get_drive_service():
-    gcp_secret = st.secrets["gcp_service_account"]
-    if isinstance(gcp_secret, str):
-        key_dict = json.loads(gcp_secret)
-    else:
-        key_dict = dict(gcp_secret)
-        
-    if "private_key" in key_dict:
-        key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-        
-    credentials = service_account.Credentials.from_service_account_info(
-        key_dict, scopes=['https://www.googleapis.com/auth/drive.file']
-    )
-    return build('drive', 'v3', credentials=credentials)
 
-def upload_to_drive(image_bytes, filename):
-    try:
-        service = get_drive_service()
-        folder_id = st.secrets["drive_folder_id"]
-        file_metadata = {'name': filename, 'parents': [folder_id]}
-        media = MediaIoBaseUpload(image_bytes, mimetype='image/jpeg', resumable=True)
-        file = service.files().create(
-            body=file_metadata, 
-            media_body=media, 
-            fields='id, webViewLink',
-            supportsAllDrives=True
-        ).execute()
-        # 成功時回傳 ID, 網址, 且錯誤訊息為 None
-        return file.get('id'), file.get('webViewLink'), None
-    except Exception as e:
-        # 失敗時回傳真實的錯誤訊息
-        return None, None, str(e)
-
-def analyze_clothing_with_gemini(main_image, label_image=None):
+# ==========================================
+# 1. Gemini 分析
+# ==========================================
+def analyze_clothing(main_image, label_image=None):
     client = genai.Client(api_key=st.secrets["gemini_api_key"])
     prompt = """
-    請分析提供的衣服照片（可能包含主照片與標籤特寫），並以繁體中文 JSON 格式回傳以下欄位：
-    - brand: 品牌名稱 (若有標籤照片請優先參考，若無則填 "未知")
-    - style: 服飾樣式 (如：風衣、短袖T恤等)
-    - color: 主要顏色
-    - gender: 適合性別 (男、女、或 中性)
-    - size: 尺寸標籤 (若有標籤照片請優先參考如 S/M/L/XL，若無請填 "未標示")
-
-    請僅回傳純 JSON 格式。
-    """
-    
-    contents_list = [main_image]
+請分析提供的衣服照片（可能包含主照片與標籤特寫），並以繁體中文 JSON 格式回傳以下欄位：
+- brand: 品牌名稱 (若有標籤照片請優先參考，若無則填 "未知")
+- style: 服飾樣式 (如：風衣、短袖T恤等)
+- color: 主要顏色
+- gender: 適合性別 (男、女、或 中性)
+- size: 尺寸標籤 (若有標籤照片請優先參考如 S/M/L/XL，若無請填 "未標示")
+請僅回傳純 JSON 格式，不要任何額外文字或 Markdown。
+"""
+    contents = [main_image]
     if label_image:
-        contents_list.append(label_image)
-    contents_list.append(prompt)
+        contents.append(label_image)
+    contents.append(prompt)
 
     response = client.models.generate_content(
         model='gemini-3.7-flash',
-        contents=contents_list
+        contents=contents
     )
     clean_text = response.text.strip().replace('```json', '').replace('```', '')
     return json.loads(clean_text)
 
-# ==========================================
-# 2. 狀態管理初始化
-# ==========================================
-if 'step' not in st.session_state:
-    st.session_state.step = 1
-if 'image_data' not in st.session_state:
-    st.session_state.image_data = None
-if 'label_image_data' not in st.session_state:
-    st.session_state.label_image_data = None
-if 'tags' not in st.session_state:
-    st.session_state.tags = {}
-if 'preview_image_data' not in st.session_state:
-    st.session_state.preview_image_data = None
-if 'upload_error' not in st.session_state:
-    st.session_state.upload_error = None
 
 # ==========================================
-# 3. 網頁前端介面與流程控制
+# 2. 分享到 LINE（呼叫手機原生分享選單；不支援時退回下載）
 # ==========================================
-st.set_page_config(page_title="智慧衣物排程標記系統", layout="centered")
-st.title("👕 智慧衣物排程標記系統")
+def line_share_button(image_bytes, filename):
+    b64 = base64.b64encode(image_bytes).decode()
+    html = f"""
+    <div style="text-align:center;font-family:sans-serif;">
+      <button id="shareBtn"
+        style="width:100%;padding:14px;font-size:17px;border:0;border-radius:10px;
+               background:#06C755;color:#fff;font-weight:bold;">
+        📲 分享到 LINE 群
+      </button>
+      <p id="msg" style="color:#888;font-size:13px;margin-top:10px;line-height:1.5;"></p>
+    </div>
+    <script>
+      const b64 = "{b64}";
+      function b64ToFile(b64, name) {{
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return new File([arr], name, {{ type: 'image/jpeg' }});
+      }}
+      const btn = document.getElementById('shareBtn');
+      const msg = document.getElementById('msg');
+      btn.addEventListener('click', async () => {{
+        try {{
+          const file = b64ToFile(b64, "{filename}");
+          if (navigator.canShare && navigator.canShare({{ files: [file] }})) {{
+            await navigator.share({{ files: [file], title: '商品上架' }});
+            msg.textContent = '已開啟分享選單，請選你的 LINE 群組送出。';
+          }} else {{
+            msg.textContent = '此瀏覽器不支援直接分享，請改用上方「下載」後，在 LINE 手動附加這張圖。';
+          }}
+        }} catch (e) {{
+          msg.textContent = '已取消或無法分享（可改用下載後手動貼到 LINE）。';
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=130)
 
-# --- 步驟 1：拍攝主照片 ---
+
+# ==========================================
+# 3. 狀態初始化
+# ==========================================
+defaults = {
+    "step": 1,
+    "main_bytes": None,
+    "label_bytes": None,
+    "qty": 1,
+    "tags": {},
+    "preview_bytes": None,
+    "filename": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ==========================================
+# 4. 介面（3 步驟）
+# ==========================================
+st.set_page_config(page_title="智慧衣物上架", layout="centered")
+st.title("👕 智慧衣物上架")
+
+# ---------- 步驟 1：一次拍好（外觀＋衣標）＋數量 ----------
 if st.session_state.step == 1:
-    st.info("步驟 1/4：請拍攝衣服全貌照片")
-    photo = st.camera_input("拍攝衣服全貌")
-    st.caption("💡 提示：如需使用手機後鏡頭，請點擊相機畫面角落的切換圖示。")
-    
-    if photo is not None:
-        st.session_state.image_data = photo.getvalue()
-        st.session_state.step = 2
-        st.rerun()
+    st.info("步驟 1／3：拍照（外觀必拍、衣標選拍）")
+    st.caption("💡 點下方欄位會叫出手機相機，選「拍照」可用後鏡頭、對焦、放大拍衣標小字，比直接用網頁相機清楚很多。")
 
-# --- 步驟 2：補拍標籤與 AI 分析 ---
-elif st.session_state.step == 2:
-    st.info("步驟 2/4：確認主照片，並可選填補拍衣標")
-    
-    main_image = Image.open(io.BytesIO(st.session_state.image_data))
-    st.image(main_image, caption="已拍攝的主照片", use_container_width=True)
-    
-    label_photo = st.camera_input("📸 補拍衣服內標 (選填)")
-    if label_photo is not None:
-        st.session_state.label_image_data = label_photo.getvalue()
-        st.success("✅ 已記錄標籤照片！")
-    
-    st.divider()
-    
-    if st.button("✨ 開始 AI 自動分析", type="primary", use_container_width=True):
-        with st.status("🤖 正在綜合分析照片中...", expanded=True) as status:
-            st.write("1. 正在傳送影像資料至 Gemini AI...")
+    main_file = st.file_uploader("① 衣服外觀（必拍）", type=["jpg", "jpeg", "png"], key="up_main")
+    if main_file:
+        st.session_state.main_bytes = main_file.getvalue()
+        st.image(st.session_state.main_bytes, caption="外觀", use_container_width=True)
+
+    label_file = st.file_uploader("② 衣服內標（選拍，有拍品牌／尺寸會更準）", type=["jpg", "jpeg", "png"], key="up_label")
+    if label_file:
+        st.session_state.label_bytes = label_file.getvalue()
+        st.image(st.session_state.label_bytes, caption="衣標", use_container_width=True)
+
+    st.session_state.qty = st.number_input("數量（庫存）", min_value=1, value=int(st.session_state.qty), step=1)
+
+    disabled = st.session_state.main_bytes is None
+    if st.button("✨ 開始 AI 分析", type="primary", use_container_width=True, disabled=disabled):
+        with st.status("🤖 分析中…", expanded=True) as status:
             try:
-                label_image = None
-                if st.session_state.label_image_data:
-                    label_image = Image.open(io.BytesIO(st.session_state.label_image_data))
-                
-                st.session_state.tags = analyze_clothing_with_gemini(main_image, label_image)
-                status.update(label="✅ AI 分析成功！", state="complete", expanded=False)
-                time.sleep(1)
-                st.session_state.step = 3
+                main_image = Image.open(io.BytesIO(st.session_state.main_bytes))
+                label_image = Image.open(io.BytesIO(st.session_state.label_bytes)) if st.session_state.label_bytes else None
+                st.session_state.tags = analyze_clothing(main_image, label_image)
+                status.update(label="✅ 分析完成", state="complete", expanded=False)
+                time.sleep(0.5)
+                st.session_state.step = 2
                 st.rerun()
             except Exception as e:
-                status.update(label="❌ AI 分析失敗", state="error", expanded=True)
-                st.error("分析發生錯誤：")
+                status.update(label="❌ 分析失敗", state="error", expanded=True)
                 st.code(str(e))
-                
-    st.write("") 
-    
-    if st.button("🔄 不滿意，重新拍攝主照片", use_container_width=True):
-        st.session_state.step = 1
-        st.session_state.label_image_data = None
-        st.rerun()
 
-# --- 步驟 3：微調標籤並產生預覽 ---
-elif st.session_state.step == 3:
-    st.info("步驟 3/4：微調標籤")
+# ---------- 步驟 2：確認／微調 ----------
+elif st.session_state.step == 2:
+    st.info("步驟 2／3：確認標籤（尺寸可直接點按）")
     tags = st.session_state.tags
-    main_image = Image.open(io.BytesIO(st.session_state.image_data))
-    
-    with st.form("schedule_form"):
-        st.subheader("請確認或修改標籤內容")
-        col1, col2 = st.columns(2)
-        with col1:
-            brand = st.text_input("品牌", value=tags.get("brand", "未知"))
-            color = st.text_input("顏色", value=tags.get("color", "")) 
-            gender_options = ["男", "女", "中性"]
-            gender_idx = gender_options.index(tags.get("gender")) if tags.get("gender") in gender_options else 2
-            gender = st.selectbox("性別", gender_options, index=gender_idx)
-        with col2:
-            style = st.text_input("樣式", value=tags.get("style", ""))
-            size = st.text_input("尺寸", value=tags.get("size", "未標示"))
-            
-        preview_button = st.form_submit_button("👀 預覽合成結果", type="primary", use_container_width=True)
-        
-        if preview_button:
-            st.session_state.tags.update({
-                "brand": brand, "color": color, "gender": gender, 
-                "style": style, "size": size
-            })
-            
-            processed_image = add_text_to_image(main_image, brand, style, color, gender, size)
-            img_byte_arr = io.BytesIO()
-            processed_image.save(img_byte_arr, format='JPEG')
-            st.session_state.preview_image_data = img_byte_arr.getvalue()
-            
-            st.session_state.step = 4
-            st.rerun()
 
-# --- 步驟 4：預覽與確認存檔 ---
-elif st.session_state.step == 4:
-    st.info("步驟 4/4：預覽確認")
-    
-    preview_img = Image.open(io.BytesIO(st.session_state.preview_image_data))
-    st.image(preview_img, caption="照片預覽 (若確認無誤請點擊下方儲存)", use_container_width=True)
-    
-    st.divider()
-    
-    if st.button("🚀 確認無誤，儲存並上傳", type="primary", use_container_width=True):
-        with st.spinner("正在上傳至雲端與本地備份..."):
-            filename = f"clothing_tagged_{int(time.time())}.jpg"
-            
-            local_dir = "local_saves"
-            os.makedirs(local_dir, exist_ok=True)
-            local_path = os.path.join(local_dir, filename)
-            with open(local_path, "wb") as f:
-                f.write(st.session_state.preview_image_data)
-            st.session_state.local_path = local_path
-            st.session_state.filename = filename
-            
-            img_byte_arr = io.BytesIO(st.session_state.preview_image_data)
-            
-            # 接收上傳函式回傳的三個值 (包含錯誤訊息)
-            file_id, web_link, error_msg = upload_to_drive(img_byte_arr, filename)
-            
-            st.session_state.web_link = web_link
-            st.session_state.upload_error = error_msg
-            st.session_state.step = 5
-            st.rerun()
-            
-    st.write("") 
-            
-    if st.button("✏️ 返回修改文字", use_container_width=True):
-        st.session_state.step = 3
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        brand = st.text_input("品牌", value=tags.get("brand", "未知"))
+        color = st.text_input("顏色", value=tags.get("color", ""))
+        gender_opts = ["男", "女", "中性"]
+        g = tags.get("gender")
+        gender = st.selectbox("性別", gender_opts, index=gender_opts.index(g) if g in gender_opts else 2)
+    with col2:
+        style = st.text_input("樣式", value=tags.get("style", ""))
+        qty = st.number_input("數量（庫存）", min_value=1, value=int(st.session_state.qty), step=1)
 
-# --- 步驟 5：完成與下載畫面 ---
-elif st.session_state.step == 5:
-    if st.session_state.web_link:
-        st.success("🎉 照片已成功存入 Google 硬碟與本地端！")
-        st.write(f"[🔗 點此檢視 Google 硬碟中的照片]({st.session_state.web_link})")
-    else:
-        # 明確顯示紅色的錯誤方塊與系統原因
-        st.error(f"⚠️ Google 硬碟上傳失敗！\n\n系統回報錯誤：{st.session_state.upload_error}")
-        st.info(f"💡 照片已安全備份至本地端資料夾：`{st.session_state.local_path}`")
-    
-    final_image = Image.open(io.BytesIO(st.session_state.preview_image_data))
-    st.image(final_image, caption="最終完成照片", use_container_width=True)
-    
-    st.divider()
-    
-    st.download_button(
-        label="💾 下載這張照片到手機相簿",
-        data=st.session_state.preview_image_data,
-        file_name=st.session_state.filename,
-        mime="image/jpeg",
-        use_container_width=True
+    size_opts = ["XS", "S", "M", "L", "XL", "XXL", "F", "未標示"]
+    ai_size = tags.get("size", "未標示")
+    size_choice = st.radio(
+        "尺寸（快速選）", size_opts,
+        index=size_opts.index(ai_size) if ai_size in size_opts else size_opts.index("未標示"),
+        horizontal=True,
     )
-    
-    if st.button("📸 拍下一件衣服", type="primary", use_container_width=True):
-        st.session_state.step = 1
-        st.session_state.image_data = None
-        st.session_state.label_image_data = None
-        st.session_state.tags = {}
-        st.session_state.preview_image_data = None
-        st.session_state.upload_error = None
-        st.rerun()
+    size_other = st.text_input("尺寸（其他，選填；填了以此為準）", value="" if ai_size in size_opts else ai_size)
+    size = size_other.strip() if size_other.strip() else size_choice
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 重拍", use_container_width=True):
+            for k in ["main_bytes", "label_bytes", "tags", "preview_bytes"]:
+                st.session_state[k] = defaults[k]
+            st.session_state.step = 1
+            st.rerun()
+    with c2:
+        if st.button("👀 產生預覽", type="primary", use_container_width=True):
+            st.session_state.tags.update({"brand": brand, "color": color, "gender": gender, "style": style, "size": size})
+            st.session_state.qty = qty
+            main_image = Image.open(io.BytesIO(st.session_state.main_bytes))
+            out = add_text_to_image(main_image, brand, style, color, gender, size, qty)
+            buf = io.BytesIO()
+            out.save(buf, format="JPEG", quality=90)
+            st.session_state.preview_bytes = buf.getvalue()
+            st.session_state.filename = f"item_{int(time.time())}.jpg"
+            st.session_state.step = 3
+            st.rerun()
+
+# ---------- 步驟 3：完成（下載／分享到 LINE） ----------
+elif st.session_state.step == 3:
+    st.info("步驟 3／3：分享到 LINE 群即完成上架")
+    st.image(st.session_state.preview_bytes, caption="成品（分享到群，機器人會自動上架）", use_container_width=True)
+
+    st.download_button(
+        "💾 下載到手機相簿", data=st.session_state.preview_bytes,
+        file_name=st.session_state.filename, mime="image/jpeg", use_container_width=True,
+    )
+    line_share_button(st.session_state.preview_bytes, st.session_state.filename)
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✏️ 返回修改", use_container_width=True):
+            st.session_state.step = 2
+            st.rerun()
+    with c2:
+        if st.button("📸 拍下一件", type="primary", use_container_width=True):
+            for k, v in defaults.items():
+                st.session_state[k] = v
+            st.rerun()
